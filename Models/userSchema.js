@@ -56,6 +56,10 @@ const userSchema = new mongoose.Schema({
         type: Number,
         default: 0,
     },
+    transactions: { // New field, should be added to the schema if not already there
+        type: [String], // An array of strings to store transaction IDs
+        default: []
+    },
 }, { createdAt: true, updatedAt: true });
 
 //hash the password before saving
