@@ -47,14 +47,14 @@ class PaymentController {
         const sslcz = new SSLCommerzPayment(
             process.env.SSL_STORE_ID,
             process.env.SSL_STORE_PASSWORD,
-            false // Sandbox mode
+            false // Sandbox mode - consider making this an environment variable for production
         );
 
         const data = {
             total_amount: parseFloat(amount.toFixed(2)),
             currency: this.CONFIG.CURRENCY,
             tran_id: transactionId,
-            success_url: `${process.env.BACKEND_URL}/api/payemt/success/?tran_id=${encodeURIComponent(transactionId)}`,
+            success_url: `${process.env.BACKEND_URL}/api/payment/success/?tran_id=${encodeURIComponent(transactionId)}`, // Corrected typo
             fail_url: `${process.env.BACKEND_URL}/api/payment/fail`,
             cancel_url: `${process.env.BACKEND_URL}/api/payment/cancel`,
             ipn_url: `${process.env.BACKEND_URL}/api/payment/ipn`,
@@ -70,7 +70,7 @@ class PaymentController {
             cus_state: user.address?.state || 'N/A',
             cus_postcode: user.address?.zip || this.CONFIG.DEFAULT_POSTCODE,
             cus_country: this.CONFIG.COUNTRY,
-            cus_phone: user.phone || 'N/A',
+            cus_phone: user.phone ? String(user.phone) : 'N/A', // Ensured phone is string
             cus_fax: 'N/A',
             shipping_method: this.CONFIG.SHIPPING_METHOD,
             ship_name: `${user.firstName} ${user.lastName}`,
@@ -104,42 +104,62 @@ class PaymentController {
         const data = req.body;
         console.log('IPN Received:', data);
 
-        if (!data.tran_id || !data.amount || !data.cus_email || !data.val_id) {
-            console.warn('Invalid IPN data received:', { tran_id: data.tran_id, amount: data.amount, cus_email: data.cus_email, val_id: data.val_id });
-            return res.status(400).send('Invalid IPN data');
-        }
-
-        // Validate email format
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(data.cus_email)) {
-            console.warn(`Invalid email format for IPN: ${data.cus_email}`);
-            return res.status(200).send('IPN handled, but invalid email format.');
+        // ✅ REDUCED VALIDATION: Only check for mandatory fields expected in the initial IPN payload
+        // cus_email is NOT guaranteed at this stage, it comes from the validation response
+        if (!data.tran_id || !data.amount || !data.val_id) {
+            console.warn('Invalid initial IPN data received (missing tran_id, amount, or val_id):', { tran_id: data.tran_id, amount: data.amount, val_id: data.val_id });
+            return res.status(400).send('Invalid initial IPN data');
         }
 
         const sslcz = new SSLCommerzPayment(
             process.env.SSL_STORE_ID,
             process.env.SSL_STORE_PASSWORD,
-            false
+            false // Sandbox mode - consistency with initiatePayment, consider env var
         );
 
         try {
             const validation = await sslcz.validate({ val_id: data.val_id });
+
+            // ✅ LOGIC: Check transaction status from SSLCommerz validation response
             if (validation.status !== 'VALID' && validation.status !== 'VALIDATED') {
                 console.warn(`IPN: Transaction ${data.tran_id} is not valid. Status: ${validation.status}`);
-                return res.status(200).send('IPN handled, but transaction not valid.');
+                // Returning 200 tells SSLCommerz that the IPN was received, but the transaction isn't considered successful by your app.
+                return res.status(200).send('IPN handled, but transaction not valid or validated by SSLCommerz.');
+            }
+
+            // ✅ LOGIC: Crucial check for transaction ID and amount consistency
+            // This prevents potential tampering by comparing the initial IPN data with the validated data.
+            if (validation.tran_id !== data.tran_id || parseFloat(validation.amount) !== parseFloat(data.amount)) {
+                console.warn(`IPN: Transaction ID or Amount mismatch. Original: ${data.tran_id}/${data.amount}, Validated: ${validation.tran_id}/${validation.amount}`);
+                return res.status(200).send('IPN handled, but transaction details mismatch after validation.');
+            }
+
+            // ✅ LOGIC: Now safely access cus_email from the validated data
+            if (!validation.cus_email) {
+                console.warn(`IPN: Validated data missing customer email for transaction ${data.tran_id}.`);
+                return res.status(200).send('IPN handled, but customer email not found in validated data.');
+            }
+
+            // ✅ LOGIC: Validate email format using the email from the validated data
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(validation.cus_email)) {
+                console.warn(`Invalid email format for validated IPN email: ${validation.cus_email}`);
+                return res.status(200).send('IPN handled, but invalid email format after validation.');
             }
 
             const tranId = validation.tran_id;
             const amount = parseFloat(validation.amount);
-            const email = validation.cus_email;
+            const email = validation.cus_email; // Use the email from the validated response
 
             const user = await User.findOne({ email });
             if (!user) {
                 console.warn(`IPN: User with email ${email} not found for transaction ${tranId}.`);
+                // It's usually okay to return 200 here so SSLCommerz doesn't retry this specific IPN,
+                // as your application can't fulfill it due to a missing user.
                 return res.status(200).send('IPN handled, but user not found.');
             }
 
-            // Check for duplicate transactions
+            // Check for duplicate transactions (Excellent!)
             if (Array.isArray(user.transactions) && user.transactions.includes(tranId)) {
                 console.warn(`IPN: Duplicate transaction ${tranId} detected.`);
                 return res.status(200).send('IPN handled, duplicate transaction.');
@@ -150,7 +170,7 @@ class PaymentController {
             user.transactions = Array.isArray(user.transactions) ? [...user.transactions, tranId] : [tranId];
             await user.save();
 
-            // Send confirmation email
+            // Send confirmation email (logic remains sound)
             const emailSubject = 'Thank You for Your Donation!';
             const emailHtml = `
                 <p>Dear ${user.firstName},</p>
@@ -178,15 +198,16 @@ class PaymentController {
                     email: user.email,
                     tranId
                 });
-                // Log detailed error for debugging
             }
 
             return res.status(200).send(`IPN handled successfully. User updated${emailSent ? ' and email sent.' : ', but email sending failed.'}`);
         } catch (error) {
-            console.error('Error validating IPN:', {
+            console.error('Error validating or processing IPN:', { // More descriptive error message
                 error: error.message,
-                tran_id: data.tran_id
+                tran_id: data.tran_id,
+                val_id: data.val_id // Include val_id for context
             });
+            // Return 500 to signal to SSLCommerz to retry the IPN later if it's an internal server error
             return res.status(500).send('Error processing IPN.');
         }
     });
