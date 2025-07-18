@@ -219,7 +219,7 @@ class PaymentController {
         if (!process.env.FRONTEND_URL) {
             return next(new CustomError('Frontend URL not configured', 500));
         }
-        return res.redirect(303, `${process.env.FRONTEND_URL}/HTML/payment-success.html?tran_id=${encodeURIComponent(tran_id)}`);
+        return res.redirect(303, `${process.env.FRONTEND_URL}/payment-success.html?tran_id=${encodeURIComponent(tran_id)}`);
     });
 
     // Handle payment failure
@@ -227,7 +227,7 @@ class PaymentController {
         if (!process.env.FRONTEND_URL) {
             return next(new CustomError('Frontend URL not configured', 500));
         }
-        return res.redirect(303, `${process.env.FRONTEND_URL}/HTML/payment-fail.html`);
+        return res.redirect(303, `${process.env.FRONTEND_URL}/payment-fail.html`);
     });
 
     // Handle payment cancellation
@@ -235,7 +235,7 @@ class PaymentController {
         if (!process.env.FRONTEND_URL) {
             return next(new CustomError('Frontend URL not configured', 500));
         }
-        return res.redirect(303, `${process.env.FRONTEND_URL}/HTML/payment-cancel.html`);
+        return res.redirect(303, `${process.env.FRONTEND_URL}/payment-cancel.html`);
     });
 
 }
