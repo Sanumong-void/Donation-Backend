@@ -94,7 +94,14 @@ class PaymentController {
 
             // Store transaction in user's record immediately
             await User.findByIdAndUpdate(user._id, {
-                $push: { transactions: { id: transactionId, amount: data.total_amount, status: 'initiated' } }
+                $push: {
+                    transactions: {
+                        id: transactionId,
+                        amount: data.total_amount,
+                        status: 'initiated',
+                        createdAt: new Date()
+                    }
+                }
             });
 
             return res.status(200).json({
@@ -140,7 +147,12 @@ class PaymentController {
                 { 'transactions.id': data.tran_id },
                 {
                     $inc: { donatedAmount: parseFloat(validation.amount) },
-                    $set: { 'transactions.$.status': 'completed', 'transactions.$.details': validation }
+                    $set: {
+                        'transactions.$.status': 'completed',
+                        'transactions.$.details': validation,
+                        'transactions.$.completedAt': new Date(),
+                        'transactions.$.paymentMethod': validation.card_issuer || 'Unknown'
+                    }
                 },
                 { new: true }
             );
@@ -181,13 +193,13 @@ class PaymentController {
         }
     });
 
-    // Handle payment success
+    // Handle payment success (GET callback)
     static paymentSuccess = asyncHandler(async (req, res, next) => {
         const { tran_id } = req.query;
 
         if (!tran_id) {
             console.warn('Success callback called without transaction ID');
-            return next(new CustomError('Transaction ID missing', 400));
+            return res.redirect(`${process.env.FRONTEND_URL}/payment-error?message=Missing transaction ID`);
         }
 
         try {
@@ -195,78 +207,119 @@ class PaymentController {
             const user = await User.findOne({ 'transactions.id': tran_id });
             if (!user) {
                 console.warn(`Success callback for unknown transaction: ${tran_id}`);
-                return next(new CustomError('Transaction not found', 404));
+                return res.redirect(`${process.env.FRONTEND_URL}/payment-error?message=Transaction not found`);
             }
 
             // Redirect to frontend with success status
             return res.redirect(303, `${process.env.FRONTEND_URL}/payment-success?tran_id=${encodeURIComponent(tran_id)}`);
         } catch (error) {
             console.error('Error in payment success handler:', error);
-            return next(new CustomError('Error processing payment success', 500));
+            return res.redirect(`${process.env.FRONTEND_URL}/payment-error?message=Error processing payment`);
         }
     });
 
-    // Handle payment failure
+    // Handle payment failure (GET callback)
     static paymentFail = asyncHandler(async (req, res, next) => {
         const { tran_id } = req.query;
 
         if (tran_id) {
-            // Update transaction status to failed if we have the ID
-            await User.updateOne(
-                { 'transactions.id': tran_id },
-                { $set: { 'transactions.$.status': 'failed' } }
-            );
+            try {
+                // Update transaction status to failed if we have the ID
+                await User.updateOne(
+                    { 'transactions.id': tran_id },
+                    {
+                        $set: {
+                            'transactions.$.status': 'failed',
+                            'transactions.$.failedAt': new Date()
+                        }
+                    }
+                );
+            } catch (error) {
+                console.error('Error updating failed transaction:', error);
+            }
         }
 
         return res.redirect(303, `${process.env.FRONTEND_URL}/payment-failed${tran_id ? `?tran_id=${encodeURIComponent(tran_id)}` : ''}`);
     });
 
-    // Handle payment cancellation
+    // Handle payment cancellation (GET callback)
     static paymentCancel = asyncHandler(async (req, res, next) => {
         const { tran_id } = req.query;
 
         if (tran_id) {
-            // Update transaction status to cancelled if we have the ID
-            await User.updateOne(
-                { 'transactions.id': tran_id },
-                { $set: { 'transactions.$.status': 'cancelled' } }
-            );
+            try {
+                // Update transaction status to cancelled if we have the ID
+                await User.updateOne(
+                    { 'transactions.id': tran_id },
+                    {
+                        $set: {
+                            'transactions.$.status': 'cancelled',
+                            'transactions.$.cancelledAt': new Date()
+                        }
+                    }
+                );
+            } catch (error) {
+                console.error('Error updating cancelled transaction:', error);
+            }
         }
 
         return res.redirect(303, `${process.env.FRONTEND_URL}/payment-cancelled${tran_id ? `?tran_id=${encodeURIComponent(tran_id)}` : ''}`);
     });
-    static handleSuccessCallback = asyncHandler(async (req, res) => {
-        const { tran_id, status } = req.body;
-        // Update database, verify payment, etc.
-        res.status(200).json({ received: true });
-    });
-    static handleFailCallback = asyncHandler(async (req, res) => {
-        const { tran_id, status, reason } = req.body;
 
-        if (!tran_id) {
-            return res.status(400).json({ error: 'Transaction ID required' });
+    // Handle server-to-server success callback (POST)
+    static handleSuccessCallback = asyncHandler(async (req, res) => {
+        const { tran_id, val_id, amount, currency, card_type } = req.body;
+
+        // Validate required fields
+        if (!tran_id || !val_id) {
+            return res.status(400).json({
+                error: 'Missing required fields',
+                required: ['tran_id', 'val_id']
+            });
         }
 
         try {
-            await User.findOneAndUpdate(
+            const sslcz = new SSLCommerzPayment(
+                process.env.SSL_STORE_ID,
+                process.env.SSL_STORE_PASSWORD,
+                process.env.NODE_ENV !== 'production'
+            );
+
+            const validation = await sslcz.validate({ val_id });
+
+            if (validation.status !== 'VALID' && validation.status !== 'VALIDATED') {
+                return res.status(400).json({ error: 'Payment validation failed' });
+            }
+
+            // Update user transaction record
+            const updatedUser = await User.findOneAndUpdate(
                 { 'transactions.id': tran_id },
                 {
                     $set: {
-                        'transactions.$.status': 'failed',
-                        'transactions.$.failReason': reason || 'Payment failed',
-                        'transactions.$.updatedAt': new Date()
-                    }
-                }
+                        'transactions.$.status': 'completed',
+                        'transactions.$.verified': true,
+                        'transactions.$.amount': amount,
+                        'transactions.$.currency': currency,
+                        'transactions.$.paymentMethod': card_type,
+                        'transactions.$.completedAt': new Date(),
+                        'transactions.$.validation': validation
+                    },
+                    $inc: { totalDonations: parseFloat(amount) }
+                },
+                { new: true, runValidators: true }
             );
+
+            if (!updatedUser) {
+                return res.status(404).json({ error: 'Transaction not found' });
+            }
 
             res.status(200).json({
                 success: true,
-                message: 'Payment failure recorded',
-                tran_id
+                message: 'Payment successfully processed',
+                transactionId: tran_id
             });
-
         } catch (error) {
-            console.error('Error processing fail callback:', error);
+            console.error('Error in handleSuccessCallback:', error);
             res.status(500).json({
                 error: 'Internal server error',
                 details: error.message
@@ -274,35 +327,80 @@ class PaymentController {
         }
     });
 
-    /**
-     * Handle server-to-server cancel callback (POST)
-     */
-    static handleCancelCallback = asyncHandler(async (req, res) => {
-        const { tran_id, status } = req.body;
+    // Handle server-to-server fail callback (POST)
+    static handleFailCallback = asyncHandler(async (req, res) => {
+        const { tran_id, error, bank_tran_id } = req.body;
 
         if (!tran_id) {
             return res.status(400).json({ error: 'Transaction ID required' });
         }
 
         try {
-            await User.findOneAndUpdate(
+            // Update transaction status
+            const updatedUser = await User.findOneAndUpdate(
+                { 'transactions.id': tran_id },
+                {
+                    $set: {
+                        'transactions.$.status': 'failed',
+                        'transactions.$.error': error || 'Payment failed',
+                        'transactions.$.bankTransactionId': bank_tran_id || null,
+                        'transactions.$.failedAt': new Date()
+                    }
+                },
+                { new: true }
+            );
+
+            if (!updatedUser) {
+                return res.status(404).json({ error: 'Transaction not found' });
+            }
+
+            res.status(200).json({
+                success: true,
+                message: 'Payment failure recorded',
+                transactionId: tran_id
+            });
+        } catch (error) {
+            console.error('Error in handleFailCallback:', error);
+            res.status(500).json({
+                error: 'Internal server error',
+                details: error.message
+            });
+        }
+    });
+
+    // Handle server-to-server cancel callback (POST)
+    static handleCancelCallback = asyncHandler(async (req, res) => {
+        const { tran_id, reason } = req.body;
+
+        if (!tran_id) {
+            return res.status(400).json({ error: 'Transaction ID required' });
+        }
+
+        try {
+            // Update transaction status
+            const updatedUser = await User.findOneAndUpdate(
                 { 'transactions.id': tran_id },
                 {
                     $set: {
                         'transactions.$.status': 'cancelled',
-                        'transactions.$.updatedAt': new Date()
+                        'transactions.$.cancellationReason': reason || 'User cancelled',
+                        'transactions.$.cancelledAt': new Date()
                     }
-                }
+                },
+                { new: true }
             );
+
+            if (!updatedUser) {
+                return res.status(404).json({ error: 'Transaction not found' });
+            }
 
             res.status(200).json({
                 success: true,
                 message: 'Payment cancellation recorded',
-                tran_id
+                transactionId: tran_id
             });
-
         } catch (error) {
-            console.error('Error processing cancel callback:', error);
+            console.error('Error in handleCancelCallback:', error);
             res.status(500).json({
                 error: 'Internal server error',
                 details: error.message
