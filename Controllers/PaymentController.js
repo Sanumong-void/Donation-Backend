@@ -1,4 +1,3 @@
-// Controllers/PaymentController.js
 const SSLCommerzPayment = require('sslcommerz-lts');
 const CustomError = require('../Utils/CustomError');
 const asyncHandler = require('../Utils/asyncHandler');
@@ -38,6 +37,9 @@ class PaymentController {
         // Input validation
         if (!user) {
             return next(new CustomError('User not authenticated.', 401));
+        }
+        if (!user.email) {
+            return next(new CustomError('User email is missing in profile.', 400));
         }
         if (!amount || typeof amount !== 'number' || amount <= 0) {
             return next(new CustomError('Please provide a valid donation amount.', 400));
@@ -100,30 +102,40 @@ class PaymentController {
         }
     });
 
+    // Handle IPN
     static handleIpn = asyncHandler(async (req, res, next) => {
         const data = req.body;
-        console.log('IPN Received:', data);
+        console.log('Full IPN Payload:', JSON.stringify(data, null, 2));
 
-        if (!data.tran_id || !data.amount || !data.cus_email || !data.val_id) {
-            console.warn('Invalid IPN data received:', { tran_id: data.tran_id, amount: data.amount, cus_email: data.cus_email, val_id: data.val_id });
+        // Validate required fields, make cus_email optional
+        if (!data.tran_id || !data.amount || !data.val_id) {
+            console.warn('Invalid IPN data received:', {
+                tran_id: data.tran_id,
+                amount: data.amount,
+                cus_email: data.cus_email,
+                val_id: data.val_id
+            });
             return res.status(400).send('Invalid IPN data');
         }
 
-        // Validate email format
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-        if (!emailRegex.test(data.cus_email)) {
-            console.warn(`Invalid email format for IPN: ${data.cus_email}`);
-            return res.status(200).send('IPN handled, but invalid email format.');
+        // Validate email format if provided
+        if (data.cus_email) {
+            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+            if (!emailRegex.test(data.cus_email)) {
+                console.warn(`Invalid email format for IPN: ${data.cus_email}`);
+                return res.status(200).send('IPN handled, but invalid email format.');
+            }
         }
 
         const sslcz = new SSLCommerzPayment(
             process.env.SSL_STORE_ID,
             process.env.SSL_STORE_PASSWORD,
-            false
+            false // Sandbox mode
         );
 
         try {
             const validation = await sslcz.validate({ val_id: data.val_id });
+            console.log('Validation Response:', JSON.stringify(validation, null, 2));
             if (validation.status !== 'VALID' && validation.status !== 'VALIDATED') {
                 console.warn(`IPN: Transaction ${data.tran_id} is not valid. Status: ${validation.status}`);
                 return res.status(200).send('IPN handled, but transaction not valid.');
@@ -131,11 +143,13 @@ class PaymentController {
 
             const tranId = validation.tran_id;
             const amount = parseFloat(validation.amount);
-            const email = validation.cus_email;
+            const email = data.cus_email || 'N/A';
 
-            const user = await User.findOne({ email });
+            // Find user by transaction ID or email (if available)
+            const userQuery = data.cus_email ? { email: data.cus_email } : { transactions: tranId };
+            const user = await User.findOne(userQuery);
             if (!user) {
-                console.warn(`IPN: User with email ${email} not found for transaction ${tranId}.`);
+                console.warn(`IPN: User not found for transaction ${tranId}. Email: ${email}`);
                 return res.status(200).send('IPN handled, but user not found.');
             }
 
@@ -178,7 +192,6 @@ class PaymentController {
                     email: user.email,
                     tranId
                 });
-                // Log detailed error for debugging
             }
 
             return res.status(200).send(`IPN handled successfully. User updated${emailSent ? ' and email sent.' : ', but email sending failed.'}`);
@@ -190,6 +203,8 @@ class PaymentController {
             return res.status(500).send('Error processing IPN.');
         }
     });
+
+    // Handle payment success
     static paymentSuccess = asyncHandler(async (req, res, next) => {
         const { tran_id } = req.query;
         if (!tran_id) {
@@ -216,7 +231,6 @@ class PaymentController {
         }
         return res.redirect(303, `${process.env.FRONTEND_URL}/HTML/payment-cancel.html`);
     });
-
 }
 
 module.exports = PaymentController;
