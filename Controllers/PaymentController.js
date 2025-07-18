@@ -235,6 +235,80 @@ class PaymentController {
 
         return res.redirect(303, `${process.env.FRONTEND_URL}/payment-cancelled${tran_id ? `?tran_id=${encodeURIComponent(tran_id)}` : ''}`);
     });
+    static handleSuccessCallback = asyncHandler(async (req, res) => {
+        const { tran_id, status } = req.body;
+        // Update database, verify payment, etc.
+        res.status(200).json({ received: true });
+    });
+    static handleFailCallback = asyncHandler(async (req, res) => {
+        const { tran_id, status, reason } = req.body;
+
+        if (!tran_id) {
+            return res.status(400).json({ error: 'Transaction ID required' });
+        }
+
+        try {
+            await User.findOneAndUpdate(
+                { 'transactions.id': tran_id },
+                {
+                    $set: {
+                        'transactions.$.status': 'failed',
+                        'transactions.$.failReason': reason || 'Payment failed',
+                        'transactions.$.updatedAt': new Date()
+                    }
+                }
+            );
+
+            res.status(200).json({
+                success: true,
+                message: 'Payment failure recorded',
+                tran_id
+            });
+
+        } catch (error) {
+            console.error('Error processing fail callback:', error);
+            res.status(500).json({
+                error: 'Internal server error',
+                details: error.message
+            });
+        }
+    });
+
+    /**
+     * Handle server-to-server cancel callback (POST)
+     */
+    static handleCancelCallback = asyncHandler(async (req, res) => {
+        const { tran_id, status } = req.body;
+
+        if (!tran_id) {
+            return res.status(400).json({ error: 'Transaction ID required' });
+        }
+
+        try {
+            await User.findOneAndUpdate(
+                { 'transactions.id': tran_id },
+                {
+                    $set: {
+                        'transactions.$.status': 'cancelled',
+                        'transactions.$.updatedAt': new Date()
+                    }
+                }
+            );
+
+            res.status(200).json({
+                success: true,
+                message: 'Payment cancellation recorded',
+                tran_id
+            });
+
+        } catch (error) {
+            console.error('Error processing cancel callback:', error);
+            res.status(500).json({
+                error: 'Internal server error',
+                details: error.message
+            });
+        }
+    });
 }
 
 module.exports = PaymentController;
