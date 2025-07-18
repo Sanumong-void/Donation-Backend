@@ -5,7 +5,7 @@ const sendEmail = require('../Utils/emailSender');
 const User = require('../Models/userSchema');
 const { v4: uuidv4 } = require('uuid');
 
-// Cache environment validation at startup
+// Environment Validation
 const requiredEnv = ['SSL_STORE_ID', 'SSL_STORE_PASSWORD', 'FRONTEND_URL', 'BACKEND_URL', 'ADMIN_EMAIL'];
 const missingEnv = requiredEnv.filter(env => !process.env[env]);
 if (missingEnv.length) {
@@ -13,7 +13,6 @@ if (missingEnv.length) {
 }
 
 class PaymentController {
-    // Configuration constants
     static CONFIG = {
         CURRENCY: 'BDT',
         COUNTRY: 'Bangladesh',
@@ -24,32 +23,24 @@ class PaymentController {
         EMI_OPTION: 0
     };
 
-    // Generate unique transaction ID
     static generateTransactionId() {
         return `TR${Date.now()}${uuidv4().slice(0, 8).toUpperCase()}`;
     }
 
-    // Initiate payment
     static initiatePayment = asyncHandler(async (req, res, next) => {
         const user = req.user;
         const { amount } = req.body;
 
-        // Input validation
-        if (!user) {
-            return next(new CustomError('User not authenticated.', 401));
-        }
-        if (!user.email) {
-            return next(new CustomError('User email is missing in profile.', 400));
-        }
-        if (!amount || typeof amount !== 'number' || amount <= 0) {
+        if (!user) return next(new CustomError('User not authenticated.', 401));
+        if (!user.email) return next(new CustomError('User email is missing in profile.', 400));
+        if (!amount || typeof amount !== 'number' || amount <= 0)
             return next(new CustomError('Please provide a valid donation amount.', 400));
-        }
 
         const transactionId = this.generateTransactionId();
         const sslcz = new SSLCommerzPayment(
             process.env.SSL_STORE_ID,
             process.env.SSL_STORE_PASSWORD,
-            false // Sandbox mode
+            false
         );
 
         const data = {
@@ -87,7 +78,7 @@ class PaymentController {
 
         try {
             const apiResponse = await sslcz.init(data);
-            if (apiResponse.GatewayPageURL) {
+            if (apiResponse?.GatewayPageURL) {
                 return res.status(200).json({
                     success: true,
                     message: 'Redirecting to SSLCommerz gateway...',
@@ -102,42 +93,32 @@ class PaymentController {
         }
     });
 
-    // Handle IPN
     static handleIpn = asyncHandler(async (req, res, next) => {
         const data = req.body;
         console.log('Full IPN Payload:', JSON.stringify(data, null, 2));
 
-        // Validate required fields, make cus_email optional
         if (!data.tran_id || !data.amount || !data.val_id) {
-            console.warn('Invalid IPN data received:', {
-                tran_id: data.tran_id,
-                amount: data.amount,
-                cus_email: data.cus_email,
-                val_id: data.val_id
-            });
+            console.warn('Invalid IPN data:', { tran_id: data.tran_id, amount: data.amount, val_id: data.val_id });
             return res.status(400).send('Invalid IPN data');
         }
 
-        // Validate email format if provided
-        if (data.cus_email) {
-            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-            if (!emailRegex.test(data.cus_email)) {
-                console.warn(`Invalid email format for IPN: ${data.cus_email}`);
-                return res.status(200).send('IPN handled, but invalid email format.');
-            }
+        if (data.cus_email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(data.cus_email)) {
+            console.warn(`Invalid email format: ${data.cus_email}`);
+            return res.status(200).send('IPN handled, but invalid email format.');
         }
 
         const sslcz = new SSLCommerzPayment(
             process.env.SSL_STORE_ID,
             process.env.SSL_STORE_PASSWORD,
-            false // Sandbox mode
+            false
         );
 
         try {
             const validation = await sslcz.validate({ val_id: data.val_id });
             console.log('Validation Response:', JSON.stringify(validation, null, 2));
-            if (validation.status !== 'VALID' && validation.status !== 'VALIDATED') {
-                console.warn(`IPN: Transaction ${data.tran_id} is not valid. Status: ${validation.status}`);
+
+            if (!['VALID', 'VALIDATED'].includes(validation.status)) {
+                console.warn(`Transaction ${data.tran_id} not valid: ${validation.status}`);
                 return res.status(200).send('IPN handled, but transaction not valid.');
             }
 
@@ -145,90 +126,63 @@ class PaymentController {
             const amount = parseFloat(validation.amount);
             const email = data.cus_email || 'N/A';
 
-            // Find user by transaction ID or email (if available)
             const userQuery = data.cus_email ? { email: data.cus_email } : { transactions: tranId };
             const user = await User.findOne(userQuery);
+
             if (!user) {
-                console.warn(`IPN: User not found for transaction ${tranId}. Email: ${email}`);
+                console.warn(`User not found: ${email}`);
                 return res.status(200).send('IPN handled, but user not found.');
             }
 
-            // Check for duplicate transactions
-            if (Array.isArray(user.transactions) && user.transactions.includes(tranId)) {
-                console.warn(`IPN: Duplicate transaction ${tranId} detected.`);
+            if (user.transactions?.includes(tranId)) {
+                console.warn(`Duplicate transaction: ${tranId}`);
                 return res.status(200).send('IPN handled, duplicate transaction.');
             }
 
-            // Update user
             user.donatedAmount = (user.donatedAmount || 0) + amount;
-            user.transactions = Array.isArray(user.transactions) ? [...user.transactions, tranId] : [tranId];
+            user.transactions = [...(user.transactions || []), tranId];
             await user.save();
 
-            // Send confirmation email
-            const emailSubject = 'Thank You for Your Donation!';
-            const emailHtml = `
-                <p>Dear ${user.firstName},</p>
-                <p>Thank you for your generous donation of <strong>BDT ${amount.toFixed(2)}</strong> to FundRaiser!</p>
-                <p>Your transaction ID is: <strong>${tranId}</strong></p>
-                <p>Your support helps us continue our work. We truly appreciate it!</p>
-                <p>Best regards,<br>The FundRaiser Team</p>
-            `;
-            const emailText = `Dear ${user.firstName},\n\nThank you for your generous donation of BDT ${amount.toFixed(2)} to FundRaiser!\n\nYour transaction ID is: ${tranId}\n\nYour support helps us continue our work. We truly appreciate it!\n\nBest regards,\nThe FundRaiser Team`;
-
-            let emailSent = false;
             try {
                 await sendEmail({
                     email: user.email,
-                    subject: emailSubject,
-                    message: emailText,
-                    html: emailHtml,
+                    subject: 'Thank You for Your Donation!',
+                    message: `Dear ${user.firstName},\n\nThank you for your generous donation of BDT ${amount.toFixed(2)} to FundRaiser!\n\nYour transaction ID is: ${tranId}\n\nYour support helps us continue our work.\n\nRegards,\nFundRaiser Team`,
+                    html: `
+                        <p>Dear ${user.firstName},</p>
+                        <p>Thank you for your donation of <strong>BDT ${amount.toFixed(2)}</strong> to FundRaiser!</p>
+                        <p>Your transaction ID is <strong>${tranId}</strong></p>
+                        <p>We appreciate your support!</p>
+                        <p>Best regards,<br>FundRaiser Team</p>
+                    `,
                     replyTo: process.env.ADMIN_EMAIL
                 });
-                console.log('Donation success email sent to:', user.email);
-                emailSent = true;
+                console.log('Donation email sent to:', user.email);
             } catch (emailError) {
-                console.error('Error sending donation success email:', {
-                    error: emailError.message,
-                    email: user.email,
-                    tranId
-                });
+                console.error('Email sending error:', emailError.message);
             }
 
-            return res.status(200).send(`IPN handled successfully. User updated${emailSent ? ' and email sent.' : ', but email sending failed.'}`);
+            return res.status(200).send('IPN handled successfully.');
         } catch (error) {
-            console.error('Error validating IPN:', {
-                error: error.message,
-                tran_id: data.tran_id
-            });
+            console.error('IPN validation failed:', error.message);
             return res.status(500).send('Error processing IPN.');
         }
     });
 
-    // Handle payment success
     static paymentSuccess = asyncHandler(async (req, res, next) => {
         const { tran_id } = req.query;
-        if (!tran_id) {
-            return next(new CustomError('Invalid transaction ID', 400));
-        }
-        if (!process.env.FRONTEND_URL) {
-            return next(new CustomError('Frontend URL not configured', 500));
-        }
+        if (!tran_id) return next(new CustomError('Invalid transaction ID', 400));
+        if (!process.env.FRONTEND_URL) return next(new CustomError('Frontend URL not configured', 500));
         return res.redirect(303, `${process.env.FRONTEND_URL}/HTML/payment-success.html?tran_id=${encodeURIComponent(tran_id)}`);
     });
 
-    // Handle payment failure
-    static paymentFail = asyncHandler(async (req, res, next) => {
-        if (!process.env.FRONTEND_URL) {
-            return next(new CustomError('Frontend URL not configured', 500));
-        }
+    static paymentFail = asyncHandler(async (_req, res, next) => {
+        if (!process.env.FRONTEND_URL) return next(new CustomError('Frontend URL not configured', 500));
         return res.redirect(303, `${process.env.FRONTEND_URL}/HTML/payment-fail.html`);
     });
 
-    // Handle payment cancellation
-    static paymentCancel = asyncHandler(async (req, res, next) => {
-        if (!process.env.FRONTEND_URL) {
-            return next(new CustomError('Frontend URL not configured', 500));
-        }
+    static paymentCancel = asyncHandler(async (_req, res, next) => {
+        if (!process.env.FRONTEND_URL) return next(new CustomError('Frontend URL not configured', 500));
         return res.redirect(303, `${process.env.FRONTEND_URL}/HTML/payment-cancel.html`);
     });
 }
