@@ -1,18 +1,17 @@
-// Routes/paymentRoutes.js (or whatever you've named it)
+// Routes/paymentRoutes.js
 const router = require('express').Router();
 const PaymentController = require('../Controllers/PaymentController');
-const authenticateUser = require('../Auth/authentication'); // Assuming this path is correct
+const authenticateUser = require('../Auth/authentication');
 
 // Route to initiate payment (requires authentication)
 router.post('/initiate', authenticateUser, PaymentController.initiatePayment);
 
-// Route for IPN (Instant Payment Notification) from SSLCommerz.
-// This route does NOT require authentication as it's a server-to-server call.
+// IPN does not need authentication as it's from SSLCommerz server
 router.post('/ipn', PaymentController.handleIpn);
 
 // Route to handle payment success.
-// SSLCommerz redirects the user's browser via a GET request to this URL.
-router.get('/success', PaymentController.paymentSuccess);
+// SSLCommerz redirects the user's browser via a POST request to this URL.
+router.post('/success', PaymentController.paymentSuccess); // <--- CHANGE THIS BACK TO POST
 
 // Route to handle payment failure.
 // SSLCommerz redirects the user's browser via a POST request to this URL.
