@@ -60,6 +60,10 @@ const userSchema = new mongoose.Schema({
         type: [String], // An array of strings to store transaction IDs
         default: []
     },
+    pendingTransactions: { // New field
+        type: [String],
+        default: []
+    },
 }, { createdAt: true, updatedAt: true });
 
 //hash the password before saving
