@@ -79,6 +79,13 @@ class PaymentController {
         };
 
         try {
+            // Store pending transaction in user document
+            user.pendingTransactions = Array.isArray(user.pendingTransactions) 
+                ? [...user.pendingTransactions, transactionId] 
+                : [transactionId];
+            await user.save();
+            console.log(`Pending transaction saved for user ${user.email}: ${transactionId}`);
+
             const apiResponse = await sslcz.init(data);
             if (apiResponse.GatewayPageURL) {
                 return res.status(200).json({
@@ -97,7 +104,7 @@ class PaymentController {
 
     static handleIpn = asyncHandler(async (req, res, next) => {
         const data = req.body;
-        console.log('IPN Request Received:', { body: data, headers: req.headers }); // Enhanced logging
+        console.log('IPN Request Received:', { body: data, headers: req.headers });
 
         // Validate mandatory fields
         if (!data.tran_id || !data.amount || !data.val_id) {
@@ -113,7 +120,7 @@ class PaymentController {
 
         try {
             const validation = await sslcz.validate({ val_id: data.val_id });
-            console.log('Validation Response:', validation); // Log validation response
+            console.log('Validation Response:', validation);
 
             // Check transaction status
             if (validation.status !== 'VALID' && validation.status !== 'VALIDATED') {
@@ -127,33 +134,32 @@ class PaymentController {
                 return res.status(200).send('IPN handled, but transaction details mismatch.');
             }
 
-            // Check for customer email
-            if (!validation.cus_email) {
-                console.warn(`IPN: Missing customer email for transaction ${data.tran_id}.`);
-                return res.status(200).send('IPN handled, but customer email not found.');
-            }
-
-            // Validate email format
-            const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-            if (!emailRegex.test(validation.cus_email)) {
-                console.warn(`Invalid email format: ${validation.cus_email}`);
-                return res.status(200).send('IPN handled, but invalid email format.');
-            }
-
             const tranId = validation.tran_id;
             const amount = parseFloat(validation.amount);
-            const email = validation.cus_email.toLowerCase(); // Normalize email
+            let user;
 
-            // Find user
-            const user = await User.findOne({ email });
+            // Try to find user by email if available
+            if (validation.cus_email) {
+                const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+                if (!emailRegex.test(validation.cus_email)) {
+                    console.warn(`Invalid email format: ${validation.cus_email}`);
+                    return res.status(200).send('IPN handled, but invalid email format.');
+                }
+                user = await User.findOne({ email: validation.cus_email.toLowerCase() });
+            }
+
+            // Fallback: Find user by transaction ID in pendingTransactions
             if (!user) {
-                console.warn(`IPN: User with email ${email} not found for transaction ${tranId}.`);
-                return res.status(200).send('IPN handled, but user not found.');
+                user = await User.findOne({ pendingTransactions: tranId });
+                if (!user) {
+                    console.warn(`IPN: User not found for transaction ${tranId}. Tried email: ${validation.cus_email || 'N/A'}`);
+                    return res.status(200).send('IPN handled, but user not found.');
+                }
             }
 
             // Check for duplicate transaction
             if (Array.isArray(user.transactions) && user.transactions.includes(tranId)) {
-                console.warn(`IPN: Duplicate transaction ${tranId} detected.`);
+                console.warn(`IPN: Duplicate transaction ${tranId} detected for user ${user.email}`);
                 return res.status(200).send('IPN handled, duplicate transaction.');
             }
 
@@ -161,10 +167,14 @@ class PaymentController {
             try {
                 user.donatedAmount = (user.donatedAmount || 0) + amount;
                 user.transactions = Array.isArray(user.transactions) ? [...user.transactions, tranId] : [tranId];
+                // Remove tranId from pendingTransactions
+                user.pendingTransactions = Array.isArray(user.pendingTransactions) 
+                    ? user.pendingTransactions.filter(id => id !== tranId) 
+                    : [];
                 await user.save();
                 console.log(`User updated: ${user.email}, Donated: ${user.donatedAmount}, Transaction: ${tranId}`);
             } catch (saveError) {
-                console.error('User save error:', { error: saveError.message, email, tranId });
+                console.error('User save error:', { error: saveError.message, email: user.email, tranId });
                 return res.status(500).send('Error saving user data.'); // Allow retry
             }
 
